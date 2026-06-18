@@ -395,7 +395,17 @@ function registerSidebarView(id, { icon = '', label, onMount, onUnmount } = {}) 
   registerAppView(id, { icon, label, onMount, onUnmount });
 }
 
-const OdysseusPkg = { addWidget, getChatInput, setChatInput, callLLM, openPanel, getConfig, setConfig, addSettingsTab, registerAppView, registerSidebarView, events, storage };
+/**
+ * Register a custom slash command that packages can handle themselves.
+ * handler(args: string[], ctx: {sid, esc}) → void | Promise<void>
+ * The user bubble is shown automatically before handler is called.
+ */
+function registerSlashCommand(name, handler) {
+  if (!window._pkgSlashCommands) window._pkgSlashCommands = {};
+  window._pkgSlashCommands[name.toLowerCase()] = handler;
+}
+
+const OdysseusPkg = { addWidget, getChatInput, setChatInput, callLLM, openPanel, getConfig, setConfig, addSettingsTab, registerAppView, registerSidebarView, registerSlashCommand, events, storage };
 
 // Expose globally so widget scripts that can't do ES6 imports can access it
 window.OdysseusPkg = OdysseusPkg;
