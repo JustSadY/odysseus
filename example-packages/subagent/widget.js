@@ -1,170 +1,104 @@
 /**
  * subagent/widget.js
- * Mission Control: break tasks into parallel subagents, watch them run live.
+ * Intercepts /parallel or /pa commands in the main chat.
+ * Runs the task through parallel subagents and streams results
+ * directly inside the chat as a native-looking AI bubble.
  *
- * Features:
- *  - Full-page app view with task input + live agent grid + streamed result
- *  - /parallel <task> command in main chat auto-routes here
- *  - Job history sidebar
+ * No separate tab — everything happens inline in the existing conversation.
  */
 (function () {
-  const pkg = window.OdysseusPkg;
-  if (!pkg?.registerAppView) {
-    console.warn('[subagent] OdysseusPkg.registerAppView not available');
-    return;
-  }
-
   const API = '/pkgs/subagent';
-  let _mounted = false;
-  let _currentStream = null;   // AbortController
-  let _jobs = [];
-  let _activeJob = null;       // current job object (live)
-  let _view = 'input';         // 'input' | 'running' | 'done' | 'history'
 
-  // ── CSS ─────────────────────────────────────────────────────────────────────
+  // ── CSS (scoped, injected once) ────────────────────────────────────────────
 
   const CSS = `
-  #sa-root {
-    display: flex; height: 100%; width: 100%; background: #0d0d1a;
-    font-family: system-ui, sans-serif; color: #e2e8f0; overflow: hidden;
+  /* Orchestrator bubble wrapper — blends with existing .msg.msg-ai */
+  .sa-bubble {
+    border: 1px solid #232338;
+    border-radius: 12px;
+    overflow: hidden;
+    margin-top: 6px;
   }
 
-  /* sidebar */
-  #sa-sidebar {
-    width: 220px; flex-shrink: 0; background: #10101e; border-right: 1px solid #1e1e35;
-    display: flex; flex-direction: column; overflow: hidden;
+  /* header bar */
+  .sa-hdr {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px 9px;
+    background: #12121e;
+    border-bottom: 1px solid #1c1c30;
+    font-size: 13px;
   }
-  #sa-sidebar-hdr {
-    padding: 14px 14px 8px; font-size: 11px; font-weight: 700;
-    text-transform: uppercase; letter-spacing: 1px; color: #4b5563;
+  .sa-hdr-icon { font-size: 15px; }
+  .sa-hdr-title { font-weight: 600; color: #c4c4e0; flex: 1; }
+  .sa-phase {
+    font-size: 10px; font-weight: 700; letter-spacing: .6px;
+    text-transform: uppercase; padding: 2px 9px; border-radius: 10px;
   }
-  #sa-sidebar-list { flex: 1; overflow-y: auto; padding: 0 6px 8px; }
-  .sa-job-item {
-    padding: 7px 10px; border-radius: 7px; cursor: pointer; margin-bottom: 3px;
-    border: 1px solid transparent; transition: background 0.12s;
-  }
-  .sa-job-item:hover { background: #1a1a2e; }
-  .sa-job-item.active { background: #1e1e35; border-color: #3b3b5a; }
-  .sa-job-title { font-size: 12px; color: #cbd5e1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .sa-job-meta  { font-size: 10px; color: #4b5563; margin-top: 2px; }
-  .sa-new-btn {
-    margin: 8px; padding: 8px; background: #1e1e35; color: #818cf8;
-    border: 1px solid #3b3b5a; border-radius: 8px; cursor: pointer; font-size: 13px;
-    text-align: center; transition: background 0.12s;
-  }
-  .sa-new-btn:hover { background: #252545; }
+  .sa-phase-planning    { background:#1e293b; color:#60a5fa; }
+  .sa-phase-running     { background:#1c1700; color:#facc15; }
+  .sa-phase-synthesizing{ background:#180f30; color:#a78bfa; }
+  .sa-phase-done        { background:#052e16; color:#4ade80; }
+  .sa-phase-error       { background:#2d0000; color:#f87171; }
 
-  /* main area */
-  #sa-main { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+  /* agent grid */
+  .sa-grid {
+    display: flex; gap: 10px; padding: 12px 14px;
+    flex-wrap: wrap; background: #0e0e1a;
+    border-bottom: 1px solid #1c1c30;
+  }
+  .sa-card {
+    background: #13131f; border: 1px solid #1e1e35;
+    border-radius: 9px; padding: 10px 12px;
+    min-width: 180px; max-width: 240px; flex: 1;
+    display: flex; flex-direction: column; gap: 6px;
+    transition: border-color .2s;
+  }
+  .sa-card.running { border-color: #ca8a04; }
+  .sa-card.done    { border-color: #16a34a; }
+  .sa-card.error   { border-color: #dc2626; }
 
-  /* ── input view ── */
-  #sa-input-view {
-    flex: 1; display: flex; flex-direction: column; align-items: center;
-    justify-content: center; padding: 40px 60px; gap: 24px;
-  }
-  #sa-input-title { font-size: 22px; font-weight: 700; color: #f1f5f9; }
-  #sa-input-sub   { font-size: 14px; color: #64748b; text-align: center; max-width: 500px; line-height: 1.6; }
-  #sa-task-input  {
-    width: 100%; max-width: 700px; min-height: 120px; resize: vertical;
-    background: #13131f; border: 1px solid #2d2d4a; border-radius: 10px;
-    color: #e2e8f0; font-size: 15px; padding: 14px 16px; outline: none;
-    font-family: inherit; line-height: 1.6;
-  }
-  #sa-task-input:focus { border-color: #4f46e5; }
-  #sa-task-input::placeholder { color: #4b5563; }
-  .sa-btn-row { display: flex; gap: 10px; width: 100%; max-width: 700px; justify-content: flex-end; }
-  .sa-btn {
-    padding: 9px 22px; border: none; border-radius: 8px;
-    cursor: pointer; font-size: 14px; font-weight: 500; transition: opacity 0.15s;
-  }
-  .sa-btn:hover { opacity: 0.85; }
-  .sa-btn-primary { background: #4f46e5; color: #fff; }
-  .sa-btn-secondary { background: #1e1e35; color: #94a3b8; border: 1px solid #2d2d4a; }
-  #sa-auto-toggle {
-    display: flex; align-items: center; gap: 8px; width: 100%; max-width: 700px;
-    font-size: 12px; color: #64748b; cursor: pointer;
-  }
-  #sa-auto-toggle input { cursor: pointer; accent-color: #4f46e5; }
-
-  /* ── running view ── */
-  #sa-running-view { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-  #sa-run-header {
-    padding: 14px 20px; border-bottom: 1px solid #1e1e35;
-    display: flex; align-items: center; gap: 12px; flex-shrink: 0;
-  }
-  #sa-run-task { font-size: 14px; color: #94a3b8; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .sa-phase-badge {
-    padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 600;
-    text-transform: uppercase; letter-spacing: 0.5px;
-  }
-  .phase-planning    { background: #1e293b; color: #60a5fa; }
-  .phase-running     { background: #1e1e00; color: #facc15; }
-  .phase-synthesizing{ background: #1a1035; color: #a78bfa; }
-  .phase-done        { background: #052e16; color: #4ade80; }
-  .phase-error       { background: #2d0000; color: #f87171; }
-
-  #sa-agents-grid {
-    display: flex; gap: 12px; padding: 16px 20px; flex-wrap: wrap; flex-shrink: 0;
-    border-bottom: 1px solid #1e1e35; min-height: 160px; align-content: flex-start;
-  }
-  .sa-agent-card {
-    background: #12121f; border: 1px solid #1e1e35; border-radius: 10px;
-    padding: 12px 14px; width: 240px; min-height: 120px;
-    display: flex; flex-direction: column; gap: 8px; transition: border-color 0.2s;
-  }
-  .sa-agent-card.running { border-color: #ca8a04; }
-  .sa-agent-card.done    { border-color: #16a34a; }
-  .sa-agent-card.error   { border-color: #dc2626; }
-  .sa-card-title { font-size: 12px; font-weight: 600; color: #cbd5e1; }
+  .sa-card-title  { font-size: 12px; font-weight: 600; color: #c4c4e0; }
   .sa-card-status {
-    font-size: 10px; display: flex; align-items: center; gap: 5px; color: #6b7280;
-  }
-  .sa-card-output {
-    font-size: 11px; color: #94a3b8; flex: 1; overflow: hidden;
-    display: -webkit-box; -webkit-line-clamp: 5; -webkit-box-orient: vertical;
-    line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+    display: flex; align-items: center; gap: 5px;
+    font-size: 10px; color: #6b7280;
   }
   .sa-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
-  .dot-pending  { background: #374151; }
-  .dot-running  { background: #ca8a04; animation: sa-blink 1s infinite; }
-  .dot-done     { background: #16a34a; }
-  .dot-error    { background: #dc2626; }
-  @keyframes sa-blink { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
+  .sa-dot-pending  { background: #374151; }
+  .sa-dot-running  { background: #ca8a04; animation: sa-blink 1s infinite; }
+  .sa-dot-done     { background: #16a34a; }
+  .sa-dot-error    { background: #dc2626; }
+  @keyframes sa-blink { 0%,100%{opacity:1} 50%{opacity:.3} }
 
-  /* ── result panel ── */
-  #sa-result-panel {
-    flex: 1; overflow-y: auto; padding: 20px 24px; min-height: 0;
+  .sa-card-out {
+    font-size: 11px; color: #94a3b8; line-height: 1.5;
+    max-height: 80px; overflow: hidden;
+    display: -webkit-box; -webkit-line-clamp: 5;
+    -webkit-box-orient: vertical;
+    white-space: pre-wrap; word-break: break-word;
   }
-  #sa-result-label {
-    font-size: 11px; font-weight: 700; text-transform: uppercase;
-    letter-spacing: 1px; color: #4b5563; margin-bottom: 12px;
-  }
-  #sa-result-body {
+
+  /* result section */
+  .sa-result {
+    padding: 12px 14px; background: #0e0e1a;
     font-size: 14px; color: #cbd5e1; line-height: 1.75;
     white-space: pre-wrap; word-break: break-word;
   }
-  #sa-result-body h1,#sa-result-body h2,#sa-result-body h3 {
-    color: #f1f5f9; margin-top: 1em; margin-bottom: 0.4em;
+  .sa-result-label {
+    font-size: 10px; font-weight: 700; letter-spacing: .8px;
+    text-transform: uppercase; color: #4b5563; margin-bottom: 8px;
   }
+  .sa-result-placeholder { color: #4b5563; font-style: italic; }
 
-  /* ── spinner ── */
-  .sa-spinner {
-    width: 12px; height: 12px; border: 2px solid #333;
+  /* spinner inline */
+  .sa-spin {
+    width: 11px; height: 11px; border: 2px solid #333;
     border-top-color: #4f46e5; border-radius: 50%;
-    animation: sa-spin 0.8s linear infinite; flex-shrink: 0;
+    animation: sa-rotate .8s linear infinite; flex-shrink: 0;
   }
-  @keyframes sa-spin { to { transform: rotate(360deg); } }
-
-  /* scrollbar */
-  #sa-result-panel::-webkit-scrollbar,
-  #sa-sidebar-list::-webkit-scrollbar { width: 5px; }
-  #sa-result-panel::-webkit-scrollbar-thumb,
-  #sa-sidebar-list::-webkit-scrollbar-thumb { background: #2d2d4a; border-radius: 3px; }
+  @keyframes sa-rotate { to { transform: rotate(360deg); } }
   `;
 
-  // ── DOM helpers ──────────────────────────────────────────────────────────────
-
-  function _css() {
+  function _injectCSS() {
     if (document.getElementById('sa-styles')) return;
     const s = document.createElement('style');
     s.id = 'sa-styles';
@@ -172,209 +106,171 @@
     document.head.appendChild(s);
   }
 
-  function _el(id) { return document.getElementById(id); }
-  function _txt(id, v) { const e = _el(id); if (e) e.textContent = v; }
+  // ── bubble builders ────────────────────────────────────────────────────────
 
-  // ── render shell ─────────────────────────────────────────────────────────────
+  /**
+   * Inject a user bubble into #chat-history (mirrors the .msg.msg-user pattern).
+   */
+  function _addUserBubble(task) {
+    const box = document.getElementById('chat-history');
+    if (!box) return;
+    const wrap = document.createElement('div');
+    wrap.className = 'msg msg-user';
+    const r = document.createElement('div');
+    r.className = 'role';
+    r.textContent = 'You';
+    const b = document.createElement('div');
+    b.className = 'body';
+    b.textContent = '/parallel ' + task;
+    wrap.appendChild(r);
+    wrap.appendChild(b);
+    box.appendChild(wrap);
+    wrap.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    return wrap;
+  }
 
-  function _renderShell(container) {
-    container.innerHTML = `
-      <div id="sa-root">
-        <div id="sa-sidebar">
-          <div class="sa-new-btn" onclick="__sa.newJob()">+ New Task</div>
-          <div id="sa-sidebar-hdr">History</div>
-          <div id="sa-sidebar-list"></div>
+  /**
+   * Inject a custom AI-style bubble that will host the orchestration UI.
+   * Returns the bubble element so we can update it during streaming.
+   */
+  function _addOrchestratorBubble(task) {
+    const box = document.getElementById('chat-history');
+    if (!box) return null;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'msg msg-ai';
+
+    const role = document.createElement('div');
+    role.className = 'role';
+    role.textContent = '⚡ Subagent Orchestrator';
+
+    const body = document.createElement('div');
+    body.className = 'body';
+
+    body.innerHTML = `
+      <div class="sa-bubble">
+        <div class="sa-hdr">
+          <span class="sa-hdr-title">${_esc(task.slice(0, 120))}${task.length > 120 ? '…' : ''}</span>
+          <span class="sa-phase sa-phase-planning" id="sa-phase-${wrap._uid = _uid()}">Planning…</span>
+          <span class="sa-spin" id="sa-spin-${wrap._uid}"></span>
         </div>
-        <div id="sa-main">
-          ${_htmlInputView()}
-          <div id="sa-running-view" style="display:none"></div>
+        <div class="sa-grid" id="sa-grid-${wrap._uid}"></div>
+        <div class="sa-result" id="sa-result-${wrap._uid}">
+          <div class="sa-result-label">Result</div>
+          <div class="sa-result-placeholder" id="sa-rtext-${wrap._uid}">Waiting for agents…</div>
         </div>
       </div>`;
+
+    wrap.appendChild(role);
+    wrap.appendChild(body);
+    box.appendChild(wrap);
+    wrap.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    return wrap;
   }
 
-  function _htmlInputView() {
-    return `
-      <div id="sa-input-view">
-        <div id="sa-input-title">⚡ Subagent Orchestrator</div>
-        <div id="sa-input-sub">
-          Describe a complex task. The orchestrator will break it into<br>
-          independent subtasks and run them in parallel simultaneously.
-        </div>
-        <textarea id="sa-task-input" placeholder="e.g. Research the top 5 AI frameworks for multi-agent systems, compare their strengths, weaknesses, and use cases, then write a decision guide for a startup."></textarea>
-        <label id="sa-auto-toggle">
-          <input type="checkbox" id="sa-auto-cb" checked>
-          Auto-detect and intercept /parallel commands from main chat
-        </label>
-        <div class="sa-btn-row">
-          <button class="sa-btn sa-btn-secondary" onclick="__sa.planOnly()">Preview Plan</button>
-          <button class="sa-btn sa-btn-primary" onclick="__sa.run()">▶ Run Parallel</button>
-        </div>
-      </div>`;
+  // ── bubble updates ─────────────────────────────────────────────────────────
+
+  function _phase(uid, phase) {
+    const el = document.getElementById(`sa-phase-${uid}`);
+    const sp = document.getElementById(`sa-spin-${uid}`);
+    if (!el) return;
+    const cls = {
+      planning: 'sa-phase-planning', running: 'sa-phase-running',
+      synthesizing: 'sa-phase-synthesizing', done: 'sa-phase-done', error: 'sa-phase-error',
+    };
+    const lbl = {
+      planning: 'Planning…', running: 'Running', synthesizing: 'Synthesizing…',
+      done: 'Done ✓', error: 'Error',
+    };
+    el.className = `sa-phase ${cls[phase] || ''}`;
+    el.textContent = lbl[phase] || phase;
+    if (sp) sp.style.display = phase === 'done' || phase === 'error' ? 'none' : '';
   }
 
-  function _renderRunningView(job) {
-    const main = _el('sa-main');
-    if (!main) return;
-    _el('sa-input-view').style.display = 'none';
-    const rv = _el('sa-running-view');
-    rv.style.display = 'flex';
-    rv.style.flexDirection = 'column';
-    rv.style.overflow = 'hidden';
-    rv.style.flex = '1';
-    rv.innerHTML = `
-      <div id="sa-run-header">
-        <span class="sa-phase-badge phase-planning" id="sa-phase-badge">Planning</span>
-        <span id="sa-run-task">${_esc(job.task.slice(0, 120))}</span>
-        <button class="sa-btn sa-btn-secondary" style="padding:4px 12px;font-size:12px"
-          onclick="__sa.cancel()">Cancel</button>
-      </div>
-      <div id="sa-agents-grid"></div>
-      <div id="sa-result-panel">
-        <div id="sa-result-label">Result</div>
-        <div id="sa-result-body" style="color:#4b5563;font-style:italic;">
-          Waiting for agents to complete…
-        </div>
-      </div>`;
-  }
-
-  // ── sidebar ──────────────────────────────────────────────────────────────────
-
-  function _renderSidebar() {
-    const list = _el('sa-sidebar-list');
-    if (!list) return;
-    if (!_jobs.length) {
-      list.innerHTML = '<div style="padding:10px 12px;font-size:11px;color:#374151">No jobs yet</div>';
-      return;
-    }
-    list.innerHTML = _jobs.map(j => `
-      <div class="sa-job-item${_activeJob && _activeJob.id === j.id ? ' active' : ''}"
-           onclick="__sa.loadJob('${j.id}')">
-        <div class="sa-job-title">${_esc(j.task.slice(0, 60))}</div>
-        <div class="sa-job-meta">${j.status} · ${j.agent_count || 0} agents</div>
-      </div>`).join('');
-  }
-
-  // ── agent cards ──────────────────────────────────────────────────────────────
-
-  function _ensureCard(id, title) {
-    const grid = _el('sa-agents-grid');
+  function _ensureCard(uid, id, title) {
+    const grid = document.getElementById(`sa-grid-${uid}`);
     if (!grid) return;
-    let card = document.getElementById(`sa-card-${id}`);
-    if (!card) {
-      card = document.createElement('div');
-      card.id = `sa-card-${id}`;
-      card.className = 'sa-agent-card pending';
-      card.innerHTML = `
-        <div class="sa-card-title">${_esc(title || `Agent ${id}`)}</div>
-        <div class="sa-card-status">
-          <span class="sa-dot dot-pending" id="sa-dot-${id}"></span>
-          <span id="sa-st-${id}">Pending</span>
-        </div>
-        <div class="sa-card-output" id="sa-out-${id}"></div>`;
-      grid.appendChild(card);
-    }
+    let card = document.getElementById(`sa-c-${uid}-${id}`);
+    if (card) return card;
+    card = document.createElement('div');
+    card.id = `sa-c-${uid}-${id}`;
+    card.className = 'sa-card';
+    card.innerHTML = `
+      <div class="sa-card-title">${_esc(title || 'Agent ' + id)}</div>
+      <div class="sa-card-status">
+        <span class="sa-dot sa-dot-pending" id="sa-dot-${uid}-${id}"></span>
+        <span id="sa-st-${uid}-${id}">Pending</span>
+      </div>
+      <div class="sa-card-out" id="sa-out-${uid}-${id}"></div>`;
+    grid.appendChild(card);
     return card;
   }
 
-  function _updateCard(id, status, delta) {
-    const card = document.getElementById(`sa-card-${id}`);
-    const dot  = _el(`sa-dot-${id}`);
-    const st   = _el(`sa-st-${id}`);
-    const out  = _el(`sa-out-${id}`);
-
-    if (card) {
-      card.className = `sa-agent-card ${status}`;
-    }
-    if (dot) {
-      dot.className = `sa-dot dot-${status}`;
-    }
+  function _updateCard(uid, id, status, delta) {
+    const card = document.getElementById(`sa-c-${uid}-${id}`);
+    const dot  = document.getElementById(`sa-dot-${uid}-${id}`);
+    const st   = document.getElementById(`sa-st-${uid}-${id}`);
+    const out  = document.getElementById(`sa-out-${uid}-${id}`);
+    if (card) card.className = `sa-card ${status}`;
+    if (dot)  dot.className  = `sa-dot sa-dot-${status}`;
     if (st) {
-      const labels = { pending: 'Pending', running: 'Running…', done: 'Done ✓', error: 'Error ✕' };
+      const labels = { pending:'Pending', running:'Running…', done:'Done ✓', error:'Error ✕' };
       st.textContent = labels[status] || status;
     }
-    if (out && delta) {
-      out.textContent = (out.textContent || '') + delta;
-    }
+    if (out && delta) out.textContent = (out.textContent || '') + delta;
   }
 
-  function _setPhaseBadge(phase) {
-    const el = _el('sa-phase-badge');
+  function _appendResult(uid, delta, isFirst) {
+    const el = document.getElementById(`sa-rtext-${uid}`);
     if (!el) return;
-    const cls = {
-      planning: 'phase-planning', running: 'phase-running',
-      synthesizing: 'phase-synthesizing', done: 'phase-done', error: 'phase-error',
-    };
-    el.className = `sa-phase-badge ${cls[phase] || ''}`;
-    const labels = {
-      planning: 'Planning', running: 'Running', synthesizing: 'Synthesizing',
-      done: 'Done', error: 'Error',
-    };
-    el.textContent = labels[phase] || phase;
+    if (isFirst) {
+      el.className = '';           // remove placeholder style
+      el.textContent = delta;
+    } else {
+      el.textContent += delta;
+    }
+    // keep bubble in view while streaming
+    el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 
-  // ── API helpers ──────────────────────────────────────────────────────────────
+  // ── orchestration runner ───────────────────────────────────────────────────
 
-  async function _api(method, path, body) {
-    const opts = { method, headers: {} };
-    if (body !== undefined) {
-      opts.headers['Content-Type'] = 'application/json';
-      opts.body = JSON.stringify(body);
-    }
-    const r = await fetch(API + path, opts);
-    if (!r.ok) {
-      const e = await r.json().catch(() => ({}));
-      throw new Error(e.detail || r.statusText);
-    }
-    return r.json();
-  }
+  async function _runInBubble(task, bubble) {
+    const uid = bubble._uid;
+    let resultStarted = false;
+    let ctrl = new AbortController();
+    bubble._saAbort = ctrl;
 
-  async function _loadHistory() {
+    let resp;
     try {
-      _jobs = await _api('GET', '/jobs');
-      _renderSidebar();
+      resp = await fetch(API + '/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task }),
+        signal: ctrl.signal,
+      });
     } catch (e) {
-      console.error('[subagent] history error', e);
+      _phase(uid, 'error');
+      _appendResult(uid, 'Network error: ' + e.message, true);
+      return;
     }
-  }
-
-  // ── run orchestration ────────────────────────────────────────────────────────
-
-  async function _run(task) {
-    if (!task.trim()) return;
-    if (_currentStream) _currentStream.abort();
-    _currentStream = new AbortController();
-
-    _activeJob = { id: null, task, status: 'planning', subtasks: [], agents: {} };
-    _renderRunningView(_activeJob);
-
-    const resp = await fetch(API + '/run', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ task }),
-      signal: _currentStream.signal,
-    });
 
     if (!resp.ok) {
-      _setPhaseBadge('error');
-      _txt('sa-result-body', 'Error: ' + resp.statusText);
+      _phase(uid, 'error');
+      _appendResult(uid, 'Error: ' + resp.statusText, true);
       return;
     }
 
     const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
+    const dec = new TextDecoder();
     let buf = '';
-    let resultText = '';
 
     while (true) {
       let done, value;
-      try {
-        ({ done, value } = await reader.read());
-      } catch (e) {
-        break;
-      }
+      try { ({ done, value } = await reader.read()); } catch { break; }
       if (done) break;
 
-      buf += decoder.decode(value, { stream: true });
+      buf += dec.decode(value, { stream: true });
       const lines = buf.split('\n');
       buf = lines.pop();
 
@@ -384,218 +280,132 @@
         try { ev = JSON.parse(line.slice(6)); } catch { continue; }
 
         switch (ev.type) {
-          case 'job_created':
-            _activeJob.id = ev.job_id;
-            break;
-
           case 'status':
-            _activeJob.status = ev.status;
-            _setPhaseBadge(ev.status);
+            _phase(uid, ev.status);
             break;
-
           case 'plan':
-            for (const st of (ev.subtasks || [])) {
-              _ensureCard(st.id, st.title);
-            }
+            for (const st of (ev.subtasks || []))
+              _ensureCard(uid, st.id, st.title);
             break;
-
           case 'agent_start':
-            _ensureCard(ev.id, ev.title);
-            _updateCard(ev.id, 'running', null);
+            _ensureCard(uid, ev.id, ev.title);
+            _updateCard(uid, ev.id, 'running', null);
             break;
-
           case 'delta':
-            _updateCard(ev.id, 'running', ev.delta);
+            _updateCard(uid, ev.id, 'running', ev.delta);
             break;
-
           case 'subtask_done':
-            _updateCard(ev.id, 'done', null);
+            _updateCard(uid, ev.id, 'done', null);
             break;
-
           case 'subtask_error':
-            _updateCard(ev.id, 'error', ev.error || 'Error');
+            _updateCard(uid, ev.id, 'error', ' ' + (ev.error || ''));
             break;
-
           case 'result_delta':
-            resultText += ev.delta;
-            const rb = _el('sa-result-body');
-            if (rb) {
-              if (rb.style.fontStyle === 'italic') rb.style.fontStyle = '';
-              rb.textContent = resultText;
-            }
+            _appendResult(uid, ev.delta, !resultStarted);
+            resultStarted = true;
             break;
-
           case 'done':
-            _activeJob.status = 'done';
-            _setPhaseBadge('done');
-            _loadHistory();
+            _phase(uid, 'done');
             break;
-
           case 'error':
-            _setPhaseBadge('error');
-            const reb = _el('sa-result-body');
-            if (reb) reb.textContent = 'Error: ' + ev.error;
+            _phase(uid, 'error');
+            _appendResult(uid, 'Error: ' + ev.error, !resultStarted);
+            resultStarted = true;
             break;
         }
       }
     }
   }
 
-  // ── plan preview ─────────────────────────────────────────────────────────────
+  // ── chat interception ──────────────────────────────────────────────────────
 
-  async function _planOnly() {
-    const ta = _el('sa-task-input');
-    if (!ta || !ta.value.trim()) return;
-    const task = ta.value.trim();
+  let _hooked = false;
 
-    const btn = document.querySelector('.sa-btn-secondary');
-    if (btn) { btn.textContent = 'Planning…'; btn.disabled = true; }
+  function _hook() {
+    if (_hooked) return;
 
-    try {
-      const r = await _api('POST', '/plan', { task });
-      const subtasks = r.subtasks || [];
-      const msg = subtasks.map((st, i) =>
-        `${i + 1}. ${st.title}\n   ${st.task.slice(0, 120)}${st.task.length > 120 ? '…' : ''}`
-      ).join('\n\n');
-      alert(`Plan (${subtasks.length} parallel agents):\n\n${msg}`);
-    } catch (e) {
-      alert('Error: ' + e.message);
-    } finally {
-      if (btn) { btn.textContent = 'Preview Plan'; btn.disabled = false; }
-    }
-  }
+    // Wait for the chat form to appear
+    const tryHook = () => {
+      const form = document.getElementById('chat-form');
+      const textarea = document.getElementById('message');
+      if (!form || !textarea) {
+        setTimeout(tryHook, 500);
+        return;
+      }
+      _hooked = true;
 
-  // ── cancel ───────────────────────────────────────────────────────────────────
+      // Intercept in CAPTURE phase — runs before chat.js's bubble-phase handler
+      form.addEventListener('submit', _interceptSubmit, true);
 
-  function _cancel() {
-    if (_currentStream) { _currentStream.abort(); _currentStream = null; }
-    _showInput();
-  }
-
-  function _showInput() {
-    const iv = _el('sa-input-view');
-    const rv = _el('sa-running-view');
-    if (iv) iv.style.display = 'flex';
-    if (rv) { rv.style.display = 'none'; rv.innerHTML = ''; }
-    _activeJob = null;
-  }
-
-  // ── load historical job ───────────────────────────────────────────────────────
-
-  async function _loadJob(jid) {
-    try {
-      const j = await _api('GET', `/jobs/${jid}`);
-      _activeJob = j;
-      _renderRunningView(j);
-      _setPhaseBadge(j.status);
-      for (const st of (j.subtasks || [])) {
-        const agent = j.agents?.[st.id] || {};
-        const card = _ensureCard(st.id, st.title);
-        if (card) {
-          _updateCard(st.id, agent.status || 'pending', null);
-          const out = _el(`sa-out-${st.id}`);
-          if (out) out.textContent = (agent.output || '').slice(0, 400);
+      // Also intercept Enter key on textarea (some chat builds submit via keydown)
+      textarea.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          const msg = textarea.value.trim();
+          if (_isParallelCmd(msg)) {
+            // The form submit will fire immediately after; let our submit handler deal with it
+          }
         }
-      }
-      const rb = _el('sa-result-body');
-      if (rb && j.result) {
-        rb.style.fontStyle = '';
-        rb.textContent = j.result;
-      }
-      _renderSidebar();
-    } catch (e) {
-      console.error('[subagent] loadJob error', e);
-    }
-  }
-
-  // ── chat command hook ────────────────────────────────────────────────────────
-
-  let _chatHookInstalled = false;
-
-  function _installChatHook() {
-    if (_chatHookInstalled) return;
-    _chatHookInstalled = true;
-
-    // Watch for the chat submit button
-    const observer = new MutationObserver(() => {
-      const form = document.querySelector('form[data-testid="chat-form"], #chat-form, form.chat-input-form');
-      if (!form || form._saHooked) return;
-      form._saHooked = true;
-
-      form.addEventListener('submit', async (e) => {
-        const cb = _el('sa-auto-cb');
-        if (!cb || !cb.checked) return;
-
-        const ta = form.querySelector('textarea');
-        const msg = ta?.value?.trim() || '';
-        if (!msg.startsWith('/parallel ') && !msg.startsWith('/pa ')) return;
-
-        e.preventDefault();
-        e.stopImmediatePropagation();
-
-        const task = msg.replace(/^\/(parallel|pa)\s+/, '');
-        ta.value = '';
-
-        // Switch to subagent view and run
-        const closeBtn = document.querySelector('[data-pkg-close="subagent"], #pkg-app-close');
-        // Open subagent view
-        pkg?.registerAppView && _openView();
-        await new Promise(r => setTimeout(r, 200));
-        _run(task);
       }, true);
-    });
+    };
 
-    observer.observe(document.body, { childList: true, subtree: true });
+    tryHook();
   }
 
-  function _openView() {
-    // Trigger the sidebar button for this package if it exists
-    const btn = document.querySelector('[data-pkg-id="subagent"]');
-    if (btn) btn.click();
+  function _isParallelCmd(msg) {
+    return msg.startsWith('/parallel ') || msg.startsWith('/pa ');
   }
 
-  // ── escape ───────────────────────────────────────────────────────────────────
+  function _extractTask(msg) {
+    return msg.replace(/^\/(parallel|pa)\s+/, '').trim();
+  }
+
+  function _interceptSubmit(e) {
+    const textarea = document.getElementById('message');
+    if (!textarea) return;
+    const msg = textarea.value.trim();
+    if (!_isParallelCmd(msg)) return;
+
+    // Stop chat.js from handling this
+    e.stopImmediatePropagation();
+    e.preventDefault();
+
+    const task = _extractTask(msg);
+    if (!task) return;
+
+    // Clear input
+    textarea.value = '';
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+
+    // Hide welcome screen if visible
+    const welcome = document.querySelector('.welcome-screen, .welcome-message, #welcome-panel');
+    if (welcome) welcome.style.display = 'none';
+    const chatContainer = document.getElementById('chat-container');
+    if (chatContainer) chatContainer.classList.remove('welcome-active');
+
+    // Add messages
+    _injectCSS();
+    _addUserBubble(task);
+    const bubble = _addOrchestratorBubble(task);
+    if (bubble) _runInBubble(task, bubble);
+  }
+
+  // ── helpers ────────────────────────────────────────────────────────────────
+
+  let _uidCounter = 0;
+  function _uid() { return String(++_uidCounter); }
 
   function _esc(s) {
     return String(s)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
-  // ── mount / unmount ───────────────────────────────────────────────────────────
+  // ── init ───────────────────────────────────────────────────────────────────
 
-  function _mount(container) {
-    _mounted = true;
-    _css();
-    _renderShell(container);
-
-    // Expose actions for onclick handlers
-    window.__sa = {
-      run:      () => { const ta = _el('sa-task-input'); if (ta) _run(ta.value); },
-      planOnly: _planOnly,
-      cancel:   _cancel,
-      newJob:   () => { _showInput(); },
-      loadJob:  _loadJob,
-    };
-
-    _installChatHook();
-    _loadHistory();
+  // Hook as soon as the widget loads
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _hook);
+  } else {
+    _hook();
   }
-
-  function _unmount() {
-    _mounted = false;
-    if (_currentStream) { _currentStream.abort(); _currentStream = null; }
-    delete window.__sa;
-  }
-
-  // ── register ──────────────────────────────────────────────────────────────────
-
-  pkg.registerAppView('subagent', {
-    icon:      '⚡',
-    label:     'Subagent',
-    onMount:   _mount,
-    onUnmount: _unmount,
-  });
 })();

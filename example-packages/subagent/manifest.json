@@ -1,9 +1,9 @@
 {
   "id": "subagent",
   "name": "Subagent Orchestrator",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Odysseus",
-  "description": "Break large tasks into parallel subtasks. Multiple AI agents work simultaneously, then results are synthesized into a final answer.",
+  "description": "Type /parallel <task> in chat to break it into parallel subagents. Results stream directly into the conversation.",
   "entryPoint": "backend.py",
   "frontend_hooks": {
     "sidebarWidget": "widget.js"
