@@ -6190,6 +6190,21 @@ const COMMANDS = {
   ping:    { alias: ['pong'], category: 'Utility', hidden: true, help: 'Check if model endpoints are alive', handler: _cmdPing, usage: '/ping' },
   probe:   { alias: ['test-models'], category: 'Utility', hidden: true, help: 'Test which models actually respond', handler: _cmdProbe, usage: '/probe [endpoint]' },
   color:   { alias: ['colour'],     hidden: true, handler: _cmdColor,   usage: '/color [hex]' },
+
+  // ── Package-provided commands ──
+  // These delegate to handlers registered by packages via OdysseusPkg.registerSlashCommand().
+  // They live here so they appear in autocomplete even before the package loads.
+  parallel: {
+    alias: ['pa'],
+    category: 'Tools',
+    help: 'Run task with multiple parallel subagents simultaneously',
+    handler: async (args, ctx) => {
+      const pkgFn = window._pkgSlashCommands && window._pkgSlashCommands['parallel'];
+      if (pkgFn) return await pkgFn(args, ctx);
+      slashReply('The <b>Subagent Orchestrator</b> package is not installed.<br>Enable it in <b>Settings → Packages</b> to use /parallel.');
+    },
+    usage: '/parallel <task description>',
+  },
 };
 
 // ── Legacy aliases ────────────────────────────────────────────────
