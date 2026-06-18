@@ -13,6 +13,15 @@ from src.execution_guard import scan_package
 
 logger = logging.getLogger(__name__)
 
+# Module-level singleton — set on PackageManager.__init__ so any module can
+# call get_manager() without needing to thread the instance through app.py.
+_instance: "PackageManager | None" = None
+
+
+def get_manager() -> "PackageManager | None":
+    """Return the active PackageManager instance (set at app startup)."""
+    return _instance
+
 MANIFEST_REQUIRED_FIELDS = {"id", "name", "version", "entryPoint"}
 
 _SUPPORTED_PERMISSIONS = {
@@ -30,6 +39,7 @@ MANIFEST_SCHEMA = {
 
 class PackageManager:
     def __init__(self, packages_dir: str, static_dir: str):
+        global _instance
         self.packages_dir = Path(packages_dir)
         self.static_packages_dir = Path(static_dir) / "packages"
         self.packages_dir.mkdir(parents=True, exist_ok=True)
@@ -40,6 +50,11 @@ class PackageManager:
         self._engine = None
         self._SessionLocal = None
         self._Base = None
+        # Health tracking (in-memory, resets on restart)
+        self._health: dict = {}          # pkg_id → {loaded_at, events_received, last_error, last_error_time}
+        self._has_routes: set = set()    # pkg_ids whose loaded module called register_routes
+        self._needs_restart: set = set() # pkg_ids upgraded while running (routes can't hot-swap)
+        _instance = self
 
     def set_app(self, app) -> None:
         """Store the FastAPI app so packages can register routes via register_routes(app)."""
@@ -50,6 +65,72 @@ class PackageManager:
         self._engine = engine
         self._SessionLocal = SessionLocal
         self._Base = Base
+
+    # ── Event system ──────────────────────────────────────────────────────────
+
+    def emit(self, event: str, **kwargs) -> None:
+        """Call a named hook on every loaded package that defines it.
+
+        Hooks are plain functions in backend.py, e.g.:
+          def on_startup(): ...
+          def on_workspace_created(ws_id, name, owner): ...
+          def on_chat_message(message, owner, session_id): ...
+          def on_memory_added(memory_id, text, owner, workspace_id): ...
+        Exceptions in one package do not prevent others from running.
+        """
+        from datetime import datetime as _dt
+        for pkg_id, module in list(self._loaded_modules.items()):
+            handler = getattr(module, event, None)
+            if callable(handler):
+                h = self._health.setdefault(pkg_id, {
+                    "loaded_at": None, "events_received": 0,
+                    "last_error": None, "last_error_time": None,
+                })
+                try:
+                    handler(**kwargs)
+                    h["events_received"] = h.get("events_received", 0) + 1
+                except Exception as e:
+                    h["last_error"] = str(e)
+                    h["last_error_time"] = _dt.utcnow().isoformat()
+                    logger.error(f"Plugin {pkg_id}: event '{event}' raised: {e}")
+
+    # ── Package config store ──────────────────────────────────────────────────
+
+    def get_config(self, pkg_id: str, owner: str = "") -> dict:
+        """Return the stored config for this package+owner pair (or defaults if none)."""
+        from core.database import get_db_session, PackageConfig
+        with get_db_session() as db:
+            row = db.query(PackageConfig).filter(
+                PackageConfig.pkg_id == pkg_id,
+                PackageConfig.owner == (owner or ""),
+            ).first()
+            return dict(row.config or {}) if row else {}
+
+    def set_config(self, pkg_id: str, owner: str = "", config: dict | None = None) -> dict:
+        """Upsert the config blob for this package+owner pair."""
+        from core.database import get_db_session, PackageConfig
+        config = config or {}
+        with get_db_session() as db:
+            row = db.query(PackageConfig).filter(
+                PackageConfig.pkg_id == pkg_id,
+                PackageConfig.owner == (owner or ""),
+            ).first()
+            if row:
+                row.config = config
+            else:
+                db.add(PackageConfig(pkg_id=pkg_id, owner=(owner or ""), config=config))
+        return config
+
+    def _init_config(self, pkg_id: str, defaults: dict) -> None:
+        """Create a default config row for this package if none exists yet."""
+        from core.database import get_db_session, PackageConfig
+        with get_db_session() as db:
+            exists = db.query(PackageConfig).filter(
+                PackageConfig.pkg_id == pkg_id,
+                PackageConfig.owner == "",
+            ).first()
+            if not exists:
+                db.add(PackageConfig(pkg_id=pkg_id, owner="", config=defaults))
 
     def install_package(self, zip_path: str, owner: str | None = None) -> dict:
         """
@@ -99,6 +180,15 @@ class PackageManager:
             pkg_id = manifest["id"]
             install_dir = self.packages_dir / pkg_id
 
+            # Detect upgrade: package already running with registered routes
+            is_upgrade = pkg_id in self._loaded_modules
+            needs_restart = is_upgrade and pkg_id in self._has_routes
+            if is_upgrade:
+                # Unload before overwriting files to release any file handles
+                self.unload_plugin(pkg_id)
+                if needs_restart:
+                    self._needs_restart.add(pkg_id)
+
             if install_dir.exists():
                 shutil.rmtree(install_dir)
 
@@ -111,12 +201,14 @@ class PackageManager:
 
             self._save_to_db(manifest, install_dir, scan_result, owner)
 
-            logger.info(f"Package installed: {pkg_id} v{manifest.get('version')} risk={scan_result['risk']}")
+            logger.info(f"Package {'upgraded' if is_upgrade else 'installed'}: {pkg_id} v{manifest.get('version')} risk={scan_result['risk']}")
             return {
                 "success": True,
                 "package_id": pkg_id,
                 "risk_level": scan_result["risk"],
                 "warnings": scan_result.get("warnings", []),
+                "is_upgrade": is_upgrade,
+                "needs_restart": needs_restart,
             }
         finally:
             if tmp_dir.exists():
@@ -205,19 +297,34 @@ class PackageManager:
             return False
 
         try:
+            from datetime import datetime as _dt
             spec = importlib.util.spec_from_file_location(f"pkg_{pkg_id}", module_file)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             self._loaded_modules[pkg_id] = module
+            h = self._health.setdefault(pkg_id, {
+                "loaded_at": None, "events_received": 0,
+                "last_error": None, "last_error_time": None,
+            })
+            h["loaded_at"] = _dt.utcnow().isoformat()
+            self._needs_restart.discard(pkg_id)
             if self._engine is not None and hasattr(module, "register_db"):
                 try:
                     module.register_db(self._engine, self._SessionLocal, self._Base)
                     logger.info(f"Plugin {pkg_id}: DB tables registered")
                 except Exception as e:
                     logger.error(f"Plugin {pkg_id}: register_db failed: {e}")
+            if hasattr(module, "register_config"):
+                try:
+                    defaults = module.register_config() or {}
+                    self._init_config(pkg_id, defaults)
+                    logger.info(f"Plugin {pkg_id}: config defaults registered")
+                except Exception as e:
+                    logger.error(f"Plugin {pkg_id}: register_config failed: {e}")
             if self._app is not None and hasattr(module, "register_routes"):
                 try:
                     module.register_routes(self._app)
+                    self._has_routes.add(pkg_id)
                     logger.info(f"Plugin {pkg_id}: routes registered")
                 except Exception as re:
                     logger.error(f"Plugin {pkg_id}: route registration failed: {re}")
@@ -225,6 +332,13 @@ class PackageManager:
             return True
         except Exception as e:
             logger.error(f"Failed to load plugin {pkg_id}: {e}")
+            h = self._health.setdefault(pkg_id, {
+                "loaded_at": None, "events_received": 0,
+                "last_error": None, "last_error_time": None,
+            })
+            from datetime import datetime as _dt
+            h["last_error"] = str(e)
+            h["last_error_time"] = _dt.utcnow().isoformat()
             return False
 
     def load_all_active(self) -> int:
@@ -250,13 +364,36 @@ class PackageManager:
                     logger.warning(f"Failed to re-publish widgets for {pkg_id}: {e}")
         count = sum(1 for pkg_id, _, _ in rows if self.load_plugin(pkg_id))
         logger.info(f"Loaded {count}/{len(rows)} active packages at startup")
+        self.emit("on_startup")
         return count
 
     def unload_plugin(self, pkg_id: str) -> bool:
         """Remove a plugin from memory (does not uninstall)."""
         self._loaded_modules.pop(pkg_id, None)
+        self._has_routes.discard(pkg_id)
+        self._needs_restart.discard(pkg_id)
         logger.info(f"Plugin unloaded: {pkg_id}")
         return True
+
+    def get_health(self, pkg_id: str) -> dict:
+        """Return runtime health stats for a package (in-memory, resets on restart)."""
+        h = self._health.get(pkg_id, {})
+        return {
+            "loaded_at": h.get("loaded_at"),
+            "events_received": h.get("events_received", 0),
+            "last_error": h.get("last_error"),
+            "last_error_time": h.get("last_error_time"),
+            "is_loaded": pkg_id in self._loaded_modules,
+            "has_routes": pkg_id in self._has_routes,
+            "needs_restart": pkg_id in self._needs_restart,
+        }
+
+    def get_all_health(self) -> dict:
+        """Return health stats for all packages."""
+        from core.database import get_db_session, Package
+        with get_db_session() as db:
+            ids = [p.id for p in db.query(Package).all()]
+        return {pkg_id: self.get_health(pkg_id) for pkg_id in ids}
 
     def toggle_plugin(self, pkg_id: str, enable: bool) -> bool:
         """Enable or disable a package at runtime without uninstalling."""
@@ -326,6 +463,7 @@ class PackageManager:
         return hooks
 
     def _pkg_to_dict(self, pkg) -> dict:
+        h = self._health.get(pkg.id, {})
         return {
             "id": pkg.id,
             "name": pkg.name,
@@ -340,4 +478,13 @@ class PackageManager:
             "owner": pkg.owner,
             "created_at": pkg.created_at.isoformat() if pkg.created_at else None,
             "updated_at": pkg.updated_at.isoformat() if pkg.updated_at else None,
+            # Runtime health (in-memory)
+            "health": {
+                "loaded_at": h.get("loaded_at"),
+                "events_received": h.get("events_received", 0),
+                "last_error": h.get("last_error"),
+                "last_error_time": h.get("last_error_time"),
+                "is_loaded": pkg.id in self._loaded_modules,
+                "needs_restart": pkg.id in self._needs_restart,
+            },
         }
