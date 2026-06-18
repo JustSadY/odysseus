@@ -197,6 +197,8 @@ export function initSlashAutocomplete(textarea) {
   let visible = false;
   let items = [];
   let selectedIdx = 0;
+  // Track tokens already in `all` so we don't add package commands twice.
+  const _allTokens = new Set(all.map(e => e.token));
 
   const hide = () => {
     if (!visible) return;
@@ -212,6 +214,16 @@ export function initSlashAutocomplete(textarea) {
   };
 
   const refresh = () => {
+    // Merge any package commands registered since last refresh (packages load async).
+    const pkgCmds = window._pkgSlashCommands || {};
+    for (const [name] of Object.entries(pkgCmds)) {
+      const token = `/${name}`;
+      if (!_allTokens.has(token)) {
+        _allTokens.add(token);
+        all.push({ token, aliases: [], category: 'Packages', help: `${name} – package command`, usage: `${token} <task>` });
+      }
+    }
+
     const v = textarea.value;
     // Only trigger when the message starts with "/" (no leading space) and
     // contains at most one space after the command (so subcommands work).
