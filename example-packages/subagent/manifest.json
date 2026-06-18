@@ -1,0 +1,11 @@
+{
+  "id": "subagent",
+  "name": "Subagent Orchestrator",
+  "version": "1.0.0",
+  "author": "Odysseus",
+  "description": "Break large tasks into parallel subtasks. Multiple AI agents work simultaneously, then results are synthesized into a final answer.",
+  "entryPoint": "backend.py",
+  "frontend_hooks": {
+    "sidebarWidget": "widget.js"
+  }
+}
