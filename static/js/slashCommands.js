@@ -6423,6 +6423,18 @@ async function handleSlashCommand(input) {
       }
     } catch (_) { /* fall through to fuzzy match */ }
 
+    // --- 4.5. Package-registered slash commands ---
+    // Packages register handlers via OdysseusPkg.registerSlashCommand(name, fn).
+    // Checked before fuzzy-match so package commands are never rejected as typos.
+    {
+      const pkgHandler = window._pkgSlashCommands && window._pkgSlashCommands[rawCmd];
+      if (pkgHandler) {
+        _showUser();
+        await pkgHandler(args, ctx);
+        return true;
+      }
+    }
+
     // --- 5. Fuzzy match for typos ---
     const suggestions = _fuzzyMatch(rawCmd);
     if (suggestions.length) {
